@@ -17,6 +17,7 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifndef USE_AC_ZERO_CROSS_DIMMER_PULSESKIP
 #ifdef USE_AC_ZERO_CROSS_DIMMER
 /*********************************************************************************************\
  * Zero-Cross AC Dimmer PMM 1..xx use 
@@ -316,3 +317,4 @@ bool Xdrv68(uint32_t function)
   return result;
 }
 #endif  // USE_AC_ZERO_CROSS_DIMMER
+#endif  // USE_AC_ZERO_CROSS_DIMMER_PULSESKIP
