@@ -17,6 +17,8 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+import matter
+
 # Matter plug-in for core behavior
 
 # dummy declaration for solidification
@@ -30,7 +32,9 @@ class Matter_Plugin_Bridge_HTTP : Matter_Plugin_Device
   static var ARG  = ""                              # additional argument name (or empty if none)
   static var ARG_HTTP = "url"                       # domain name
   static var UPDATE_TIME = 3000                     # update every 3s
-  static var HTTP_TIMEOUT = 300                     # wait for 300ms max, since we're on LAN
+  static var UPDATE_CMD = "Status 11"               # command to send for updates
+  static var PROBE_TIMEOUT = 1700                   # timeout of 1800 ms for probing, which gives at least 1s for TCP recovery
+  static var SYNC_TIMEOUT = 500                     # timeout of 700 ms for probing
   static var CLUSTERS  = {
     # 0x001D: inherited                             # Descriptor Cluster 9.5 p.453
     # 0x0003: inherited                             # Identify 1.2 p.16
@@ -39,17 +43,12 @@ class Matter_Plugin_Bridge_HTTP : Matter_Plugin_Device
     # 0x0006: [0,0xFFFC,0xFFFD],                    # On/Off 1.5 p.48
 
     # 0x0028: [0,1,2,3,4,5,6,7,8,9,0x0A,0x0F,0x12,0x13],# Basic Information Cluster cluster 11.1 p.565
-    0x0039: [0x11]                                  # Bridged Device Basic Information 9.13 p.485
+    # 0x0039: [0x11]                                  # Bridged Device Basic Information 9.13 p.485
 
   }
   # static var TYPES = { 0x010A: 2 }       # On/Off Light
 
-  var tasmota_http                                  # domain name for HTTP, ex: 'http://192.168.1.10/'
-  var tasmota_status_8                              # remote `Status 8` sensor values (last known)
-  var tasmota_status_11                             # remote `Status 11` light values (last known)
-                                                    # each contain a `_tick` attribute to known when they were last loaded
-  var reachable                                     # is the device reachable
-  var reachable_tick                                # last tick when the reachability was seen (avoids sending superfluous ping commands)
+  var http_remote                                   # instance of Matter_HTTP_remote
 
   #############################################################
   # Constructor
@@ -57,122 +56,114 @@ class Matter_Plugin_Bridge_HTTP : Matter_Plugin_Device
     import string
     super(self).init(device, endpoint, arguments)
 
-    var http = arguments.find(self.ARG_HTTP)
-    if http
-      if string.find(http, '://') < 0
-        http = "http://" + http + "/"
-      end
-      self.tasmota_http = http
-    else
-      tasmota.log(string.format("MTR: ERROR: 'url' is not configured for endpoint %i", endpoint), 2)
-    end
-    self.tasmota_status_8 = nil
-    self.tasmota_status_11 = nil
-    self.reachable = false                          # force a valid bool value
+    var addr = arguments.find(self.ARG_HTTP)
+    self.http_remote = self.device.register_http_remote(addr, self.PROBE_TIMEOUT)
+    self.register_cmd_cb()
   end
 
   #############################################################
-  # return the map of all types, add the bridged type
-  def get_types()
-    var types = {}
-    for k: self.TYPES.keys()
-      types[k] = self.TYPES[k]
-    end
-    # Add Bridged Node
-    types[0x0013] = 1                   # Bridged Node, v1
-    return types
+  # register_cmd_cb
+  #
+  # Register recurrent command and callback
+  # Defined as a separate method to allow override
+  def register_cmd_cb()
+    self.http_remote.add_schedule(self.UPDATE_CMD, self.UPDATE_TIME,
+                                  / status,payload,cmd -> self.parse_http_response(status,payload,cmd))
   end
 
   #############################################################
-  # call_remote
+  # Stub for updating shadow values (local copies of what we published to the Matter gateway)
+  #
+  # This method should collect the data from the local or remote device
+  # and call `parse_update(<data>)` when data is available.
+  def update_shadow()
+    self.tick = self.device.tick
+    var ret = self.call_remote_sync(self.UPDATE_CMD)
+    if ret
+      self.parse_http_response(1, ret, self.UPDATE_CMD)
+    end
+  end
+
+  #############################################################
+  # Stub for updating shadow values (local copies of what we published to the Matter gateway)
+  #
+  # TO BE OVERRIDDEN
+  def parse_update(data, index)
+  end
+
+  #############################################################
+  # call_remote_sync
   #
   # Call a remote Tasmota device, returns Berry native map or nil
-  def call_remote(cmd, arg)
-    if !self.tasmota_http  return nil  end
-    import json
+  # arg can be nil, in this case `cmd` has it all
+  def call_remote_sync(cmd, arg)
+    # if !self.http_remote  return nil  end
     import string
-    if !tasmota.wifi()['up'] && !tasmota.eth()['up']    return nil    end       # no network
+    import json
+
     var retry = 2         # try 2 times if first failed
+    if arg != nil     cmd = cmd + ' ' + str(arg)      end
     while retry > 0
-      var cl = webclient()
-      cl.set_timeouts(1000, 1000)
-      cl.set_follow_redirects(false)
-      var url = string.format("%scm?cmnd=%s%%20%s", self.tasmota_http, cmd, arg ? arg : '')
-      tasmota.log("MTR: HTTP GET "+url, 3)
-      cl.begin(url)
-      var r = cl.GET()
-      tasmota.log("MTR: HTTP GET code=" + str(r), 3)
-      if r == 200
-        var s = cl.get_string()
-        cl.close()
-        tasmota.log("MTR: HTTP GET payload=" + s, 3)
-        var j = json.load(s)
-        # device is known to be reachable
-        self.reachable = true
-        self.reachable_tick = self.device.tick
+      var ret = self.http_remote.call_sync(cmd, self.SYNC_TIMEOUT)
+      if ret != nil
+        self.http_remote.device_is_alive(true)
+        var j = json.load(ret)
         return j
       end
-      cl.close()
-
       retry -= 1
       tasmota.log("MTR: HTTP GET retrying", 3)
     end
-    self.reachable = false
+    self.http_remote.device_is_alive(false)
     return nil
   end
 
   #############################################################
-  # is_reachable()
+  # parse_http_response
   #
-  # Pings the device and checks if it's reachable
-  def is_reachable()
-    if self.device.tick != self.reachable_tick
-      var ret = self.call_remote("", "")        # empty command works as a ping
-      self.reachable = (ret != nil)
-      # self.reachable_tick = cur_tick    # done by caller
+  # Parse response from HTTP API and update shadows
+  # We support:
+  #     `Status  8`: {"StatusSNS":{ [...] }}
+  #     `Status 11`: {"StatusSTS":{ [...] }}
+  #     `Status 13`: {"StatusSHT":{ [...] }}
+  def parse_http_response(status, payload, cmd)
+    if status > 0
+      # device is known to be reachable
+      self.http_remote.device_is_alive(true)
+      var tick = self.device.tick
+
+      import json
+      var j = json.load(payload)
+      var code = nil                        # index of Status
+      if j
+        # filter
+        if   j.contains("StatusSNS")        # Status 8
+          j = j["StatusSNS"]
+          code = 8
+        elif j.contains("StatusSTS")        # Status 11
+          j = j["StatusSTS"]
+          code = 11
+        elif j.contains("StatusSHT")        # Status 13
+          j = j["StatusSTS"]
+          code = 13
+        end
+        # convert to shadow values
+        self.parse_update(j, code)          # call parser
+      end
     end
-    return self.reachable
   end
 
-  #############################################################
-  # get_status_8()
-  #
-  # Get remote `Status 8` values of sensors, and cache for the current tick
-  def get_status_8()
-    var cur_tick = self.device.tick
-    if self.tasmota_status_8 == nil  ||  self.tasmota_status_8.find("_tick") != cur_tick
-      var ret = self.call_remote("Status", "8")        # call `Status 8`
-      if ret
-        ret["_tick"] = cur_tick
-        self.tasmota_status_8 = ret
-        return ret
-      else
-        return nil
-      end
-    else
-      return self.tasmota_status_8                    # return cached value
-    end
-  end
-
-  #############################################################
-  # get_status_11()
-  #
-  # Get remote `Status 11` values of sensors, and cache for the current tick
-  def get_status_11()
-    var cur_tick = self.device.tick
-    if self.tasmota_status_11 == nil  ||  self.tasmota_status_11.find("_tick") != cur_tick
-      var ret = self.call_remote("Status", "11")      # call `Status 8`
-      if ret
-        ret["_tick"] = cur_tick
-        self.tasmota_status_11 = ret
-        return ret
-      else
-        return nil
-      end
-    else
-      return self.tasmota_status_11                   # return cached value
-    end
-  end
+  # #############################################################
+  # # is_reachable()
+  # #
+  # # Pings the device and checks if it's reachable
+  # def is_reachable_lazy_sync()
+  #   var cur_tick = self.device.tick
+  #   if cur_tick != self.tick
+  #     var ret = self.call_remote_sync("", "")        # empty command works as a ping
+  #     self.http_remote.device_is_alive(ret != nil)
+  #   end
+  #   return self.http_remote.reachable
+  # end
 
   #############################################################
   # read attribute
@@ -185,15 +176,23 @@ class Matter_Plugin_Bridge_HTTP : Matter_Plugin_Device
     # ====================================================================================================
     if   cluster == 0x0039              # ========== Bridged Device Basic Information 9.13 p.485 ==========
 
-      if   attribute == 0x0000          #  ---------- DataModelRevision / CommissioningWindowStatus ----------
-        # return TLV.create_TLV(TLV.U2, 1)
-      elif attribute == 0x0011          #  ---------- Reachable / bool ----------
-        return TLV.create_TLV(TLV.BOOL, true)     # TODO find a way to do a ping
+      if   attribute == 0x0011          #  ---------- Reachable / bool ----------
+        # self.is_reachable_lazy_sync()   # Not needed anymore
+        return TLV.create_TLV(TLV.BOOL, self.http_remote.reachable)     # TODO find a way to do a ping
       end
 
     else
       return super(self).read_attribute(session, ctx)
     end
+  end
+
+  #############################################################
+  # every_250ms
+  #
+  # check if the timer expired and update_shadow() needs to be called
+  def every_250ms()
+    self.http_remote.scheduler()          # defer to HTTP scheduler
+    # avoid calling update_shadow() since it's not applicable for HTTP remote
   end
 
   #############################################################
@@ -207,7 +206,7 @@ class Matter_Plugin_Bridge_HTTP : Matter_Plugin_Device
 
     var url = str(conf.find(_class.ARG_HTTP, ''))
     var arg = s + "," + url
-    print("MTR: ui_conf_to_string", conf, cl, arg)
+    # print("MTR: ui_conf_to_string", conf, cl, arg)
     return arg
   end
 
@@ -220,9 +219,23 @@ class Matter_Plugin_Bridge_HTTP : Matter_Plugin_Device
     var elts = string.split(arg + ',', ',', 3)     # add ',' at the end to be sure to have at least 2 arguments
     conf[_class.ARG_HTTP] = elts[1]
     super(_class).ui_string_to_conf(cl, conf, elts[0])
-    print("ui_string_to_conf", conf, arg)
+    # print("ui_string_to_conf", conf, arg)
     return conf
   end
 
+  #############################################################
+  # web_values
+  #
+  # Show values of the remote device as HTML
+  def web_values()
+    import webserver
+    webserver.content_send("| &lt;-- (" + self.NAME + ") --&gt;")
+  end
+
+  # Show on/off value as html
+  def web_value_onoff(onoff)
+    var onoff_html = (onoff != nil ? (onoff ? "<b>On</b>" : "Off") : "")
+    return onoff_html
+  end
 end
 matter.Plugin_Bridge_HTTP = Matter_Plugin_Bridge_HTTP

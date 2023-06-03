@@ -205,7 +205,7 @@
 #define USE_SPI
 #define USE_SDCARD
 
-#undef USE_I2C
+#define USE_I2C
 #undef USE_HOME_ASSISTANT
 #define USE_TASMOTA_DISCOVERY                    // Enable Tasmota Discovery support (+2k code)
 #undef USE_DOMOTICZ
@@ -314,7 +314,7 @@
 #define USE_UNIVERSAL_DISPLAY
 #define USE_DISPLAY_LVGL_ONLY
 
-#undef USE_DISPLAY_MODES1TO5
+//#undef USE_DISPLAY_MODES1TO5
 #undef USE_DISPLAY_LCD
 #undef USE_DISPLAY_SSD1306
 #undef USE_DISPLAY_MATRIX

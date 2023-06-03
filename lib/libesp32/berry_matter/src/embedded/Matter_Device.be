@@ -17,6 +17,8 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+import matter
+
 #@ solidify:Matter_Device,weak
 
 class Matter_Device
@@ -54,6 +56,8 @@ class Matter_Device
   # mDNS active announces
   var mdns_pase_eth                   # do we have an active PASE mDNS announce for eth
   var mdns_pase_wifi                  # do we have an active PASE mDNS announce for wifi
+  # for brige mode, list of HTTP_remote objects (only one instance per remote object)
+  var http_remotes                    # map of 'domain:port' or `nil` if no bridge
   # saved in parameters
   var root_discriminator              # as `int`
   var root_passcode                   # as `int`
@@ -381,9 +385,9 @@ class Matter_Device
   # Start Operational Discovery for this session
   #
   # Deferred until next tick.
-  def start_operational_discovery_deferred(session)
+  def start_operational_discovery_deferred(fabric)
     # defer to next click
-    tasmota.set_timer(0, /-> self.start_operational_discovery(session))
+    tasmota.set_timer(0, /-> self.start_operational_discovery(fabric))
   end
 
   #############################################################
@@ -400,7 +404,7 @@ class Matter_Device
   #
   # Stop Basic Commissioning and clean PASE specific values (to save memory).
   # Announce fabric entry in mDNS.
-  def start_operational_discovery(session)
+  def start_operational_discovery(fabric)
     import crypto
     import mdns
     import string
@@ -411,10 +415,7 @@ class Matter_Device
     # self.root_w1 = nil
     self.root_L = nil
 
-    # we keep the PASE session for 1 minute
-    session.set_expire_in_seconds(60)
-
-    self.mdns_announce_op_discovery(session.get_fabric())
+    self.mdns_announce_op_discovery(fabric)
   end
 
   #############################################################
@@ -679,13 +680,23 @@ class Matter_Device
     var endpoints = self.k2l_num(config)
     tasmota.log("MTR: endpoints to be configured "+str(endpoints), 3)
 
+    # start with mandatory endpoint 0 for root node
+    self.plugins.push(matter.Plugin_Root(self, 0, {}))
+    tasmota.log(string.format("MTR: endpoint:%i type:%s%s", 0, 'root', ''), 2)
+
+    # always include an aggregator for dynamic endpoints
+    self.plugins.push(matter.Plugin_Aggregator(self, 0xFF00, {}))
+    tasmota.log(string.format("MTR: endpoint:%i type:%s%s", 0xFF00, 'aggregator', ''), 2)
+
     for ep: endpoints
+      if ep == 0  continue end          # skip endpoint 0
       try
         var plugin_conf = config[str(ep)]
         tasmota.log(string.format("MTR: endpoint %i config %s", ep, plugin_conf), 3)
 
         var pi_class_name = plugin_conf.find('type')
         if pi_class_name == nil   tasmota.log("MTR: no class name, skipping", 3)  continue end
+        if pi_class_name == 'root'  tasmota.log("MTR: only one root node allowed", 3)  continue end
         var pi_class = self.plugins_classes.find(pi_class_name)
         if pi_class == nil        tasmota.log("MTR: unknown class name '"+str(pi_class_name)+"' skipping", 2)  continue  end
 
@@ -1003,9 +1014,6 @@ class Matter_Device
     import json
     var m = {}
 
-    # add the default plugin
-    m["0"] = {'type':'root'}
-
     # check if we have a light
     var endpoint = 1
     var light_present = false
@@ -1213,6 +1221,28 @@ class Matter_Device
       end
       if passcode != nil    return passcode     end
     end
+  end
+
+  #####################################################################
+  # Manager HTTP remotes
+  #####################################################################
+  # register new http remote
+  #
+  # If already registered, return current instance and check timeout
+  def register_http_remote(addr, timeout)
+    if self.http_remotes == nil     self.http_remotes = {}    end     # lazy initialization
+    var http_remote
+
+    if self.http_remotes.contains(addr)
+      http_remote = self.http_remotes[addr]
+      if timeout < http_remote.get_timeout()
+        http_remote.set_timeout(timeout)          # reduce timeout if new value is shorter
+      end
+    else
+      http_remote = matter.HTTP_remote(addr, timeout)
+      self.http_remotes[addr] = http_remote
+    end
+    return http_remote
   end
 
   #####################################################################
